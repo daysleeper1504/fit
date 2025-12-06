@@ -59,8 +59,10 @@ export const Content = {
 	 * @see https://developer.mozilla.org/en-US/docs/Web/API/btoa#unicode_strings
 	 */
 	encodeToBase64: (plainText: string | PlainTextContent): Base64Content => {
-		// Convert UTF-8 string to bytes, then to base64
-		return Buffer.from(plainText, 'utf8').toString('base64') as Base64Content;
+		// Convert UTF-8 string to bytes, then to base64 (browser-compatible)
+		const utf8Bytes = new TextEncoder().encode(plainText);
+		const binaryString = Array.from(utf8Bytes, byte => String.fromCharCode(byte)).join('');
+		return btoa(binaryString) as Base64Content;
 	},
 
 	/**

@@ -14,6 +14,7 @@ import { FileContent, isBinaryExtension } from "./util/contentEncoding";
 import { FilePath, detectNormalizationIssues } from "./util/filePath";
 import { withSlowOperationMonitoring } from "./util/asyncMonitoring";
 import { fitLogger } from "./logger";
+import { createObsidianFetchAdapter } from "./util/obsidianFetchAdapter";
 
 /**
  * Represents a node in GitHub's git tree structure
@@ -67,9 +68,13 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		deviceName: string
 	) {
 		// Use Octokit with retry plugin for enhanced rate limiting handling
+		// Use Obsidian's requestUrl as fetch adapter to bypass CORS
 		const OctokitWithRetry = Octokit.plugin(retry);
 		this.octokit = new OctokitWithRetry({
-			auth: pat
+			auth: pat,
+			request: {
+				fetch: createObsidianFetchAdapter()
+			}
 			// Retry plugin operates silently - users will simply experience fewer rate limit errors
 			// Future: Could add verbose logging option to plugin settings
 		});
@@ -179,12 +184,23 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 			return await this.wrapOctokitError(error, 'repo-or-branch');
 		}
 	}
-
 	/**
-	 * Get the latest commit SHA from the current branch
+	 * Get the latest commit SHA from the current branch.
+	 * Returns null if the branch doesn't exist yet (new branch case).
 	 */
-	private async getLatestCommitSha(): Promise<CommitSha> {
-		return await this.getRef(`heads/${this.branch}`);
+	private async getLatestCommitSha(): Promise<CommitSha | null> {
+		try {
+			return await this.getRef(`heads/${this.branch}`);
+		} catch (error) {
+			const errorObj = error as { status?: number };
+			// 404 means the branch doesn't exist yet - this is normal for new branches
+			if (errorObj.status === 404) {
+				fitLogger.log(`[getLatestCommitSha] Branch '${this.branch}' doesn't exist yet, treating as new branch`);
+				return null;
+			}
+			// Re-throw other errors
+			throw error;
+		}
 	}
 
 	/**
@@ -485,7 +501,90 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 				});
 			return response.map(r => r.name);
 		} catch (error: unknown) {
+			const errorObj = error as { status?: number };
+
+			// 404 on branches usually means the repository is empty (no commits yet)
+			// This is normal for a newly created repository
+			if (errorObj.status === 404) {
+				fitLogger.log('[getBranches] Repository is empty (no branches/commits yet), returning empty array');
+				return [];
+			}
+
 			return await this.wrapOctokitError(error, 'repo');
+		}
+	}
+
+	/**
+	 * Get default branch name for the repository
+	 * Returns the default branch configured on GitHub for an empty repo
+	 * Most GitHub instances default to "main", some older ones to "master"
+	 */
+	async getDefaultBranch(): Promise<string> {
+		try {
+			// Try to get repo info which includes default_branch
+			const {data: response} = await this.octokit.request(
+				`GET /repos/{owner}/{repo}`,
+				{
+					owner: this.owner,
+					repo: this.repo,
+					headers: this.headers
+				});
+			const repoData = response as { default_branch?: string };
+			if (repoData.default_branch) {
+				fitLogger.log(`[getDefaultBranch] Got default branch: ${repoData.default_branch}`);
+				return repoData.default_branch;
+			}
+			return 'main'; // Fallback to common default
+		} catch (error) {
+			fitLogger.log('[getDefaultBranch] Error getting default branch, using fallback', { error });
+			// If repo is empty or other error, return common defaults
+			return 'main';
+		}
+	}
+
+	/**
+	 * Create a new branch based on the default branch
+	 * Used when user wants to create a new branch from the settings UI
+	 */
+	async createBranch(branchName: string): Promise<void> {
+		try {
+			// Get the default branch to base the new branch on
+			const defaultBranchName = await this.getDefaultBranch();
+
+			// Get the commit SHA of the default branch
+			const { data: defaultRef } = await this.octokit.request(
+				`GET /repos/{owner}/{repo}/git/refs/heads/{ref}`,
+				{
+					owner: this.owner,
+					repo: this.repo,
+					ref: defaultBranchName,
+					headers: this.headers
+				}
+			);
+
+			const defaultCommitSha = defaultRef.object.sha;
+
+			// Create the new branch
+			await this.octokit.request(
+				`POST /repos/{owner}/{repo}/git/refs`,
+				{
+					owner: this.owner,
+					repo: this.repo,
+					ref: `refs/heads/${branchName}`,
+					sha: defaultCommitSha,
+					headers: this.headers
+				}
+			);
+
+			fitLogger.log(`[createBranch] Successfully created branch '${branchName}'`);
+		} catch (error) {
+			const errorObj = error as { status?: number, message?: string };
+			if (errorObj.status === 422) {
+				// Branch already exists
+				fitLogger.log(`[createBranch] Branch '${branchName}' already exists`);
+				return;
+			}
+			throw error;
 		}
 	}
 
@@ -635,6 +734,14 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 	 */
 	async readFromSource(): Promise<VaultReadResult<"remote">> {
 		const commitSha = await this.getLatestCommitSha();
+
+		// Handle new branch case - branch doesn't exist yet
+		if (commitSha === null) {
+			fitLogger.log(`.... 📦 [RemoteVault] New branch '${this.branch}' - treating as empty state`);
+			// For new branches, return an empty state with a fake SHA
+			// This allows the first sync to push initial content
+			return { state: {}, commitSha: '0000000000000000000000000000000000000000' as CommitSha };
+		}
 
 		// Return cached state if remote hasn't changed
 		if (commitSha === this.latestKnownCommitSha && this.latestKnownState !== null) {

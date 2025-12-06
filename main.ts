@@ -20,18 +20,26 @@ import { handleCriticalError } from 'src/util/errorHandling';
  * Settings are persisted in Obsidian's plugin data storage
  */
 export interface FitSettings {
-	// TODO: When adding support for multiple remote providers (GitLab, Gitea),
-	// consider using a discriminated union structure:
-	// remote: { provider: "github", pat: string, owner: string, ... }
-	//       | { provider: "gitlab", token: string, project: string, ... }
-	//       | { provider: "gitea", token: string, owner: string, ... }
-	// This would allow type-safe, provider-specific settings.
-	// See RemoteVaultProvider type in src/vault.ts for provider enum.
+	// Provider selection
+	provider: "github" | "gitea";
+
+	// GitHub settings
 	pat: string;
 	owner: string;
 	avatarUrl: string;
 	repo: string;
 	branch: string;
+
+	// Gitea settings
+	giteaUrl: string;
+	giteaToken: string;
+	giteaOwner: string;
+	giteaAvatarUrl: string;
+	giteaRepo: string;
+	giteaBranch: string;
+	giteaUseHttp: boolean;
+
+	// Common settings
 	deviceName: string;
 	checkEveryXMinutes: number
 	autoSync: "on" | "off" | "muted" | "remind"
@@ -41,11 +49,22 @@ export interface FitSettings {
 }
 
 const DEFAULT_SETTINGS: FitSettings = {
+	provider: "github",
+	// GitHub settings
 	pat: "",
 	owner: "",
 	avatarUrl: "",
 	repo: "",
 	branch: "",
+	// Gitea settings
+	giteaUrl: "",
+	giteaToken: "",
+	giteaOwner: "",
+	giteaAvatarUrl: "",
+	giteaRepo: "",
+	giteaBranch: "",
+	giteaUseHttp: false,
+	// Common settings
 	deviceName: "",
 	checkEveryXMinutes: 5,
 	autoSync: "off",
@@ -121,17 +140,38 @@ export default class FitPlugin extends Plugin {
 
 	checkSettingsConfigured(): boolean {
 		const actionItems: Array<string> = [];
-		if (this.settings.pat === "") {
-			actionItems.push("provide GitHub personal access token");
-		}
-		if (this.settings.owner === "") {
-			actionItems.push("authenticate with personal access token");
-		}
-		if (this.settings.repo === "") {
-			actionItems.push("select a repository to sync to");
-		}
-		if (this.settings.branch === "") {
-			actionItems.push("select a branch to sync to");
+
+		if (this.settings.provider === "gitea") {
+			// Gitea validation
+			if (this.settings.giteaUrl === "") {
+				actionItems.push("provide Gitea server URL");
+			}
+			if (this.settings.giteaToken === "") {
+				actionItems.push("provide Gitea access token");
+			}
+			if (this.settings.giteaOwner === "") {
+				actionItems.push("authenticate with Gitea token");
+			}
+			if (this.settings.giteaRepo === "") {
+				actionItems.push("select a repository to sync to");
+			}
+			if (this.settings.giteaBranch === "") {
+				actionItems.push("select a branch to sync to");
+			}
+		} else {
+			// GitHub validation
+			if (this.settings.pat === "") {
+				actionItems.push("provide GitHub personal access token");
+			}
+			if (this.settings.owner === "") {
+				actionItems.push("authenticate with personal access token");
+			}
+			if (this.settings.repo === "") {
+				actionItems.push("select a repository to sync to");
+			}
+			if (this.settings.branch === "") {
+				actionItems.push("select a branch to sync to");
+			}
 		}
 
 		if (actionItems.length > 0) {
@@ -140,7 +180,6 @@ export default class FitPlugin extends Plugin {
 			this.openPluginSettings();
 			settingsNotice.remove("static");
 			return false;
-
 		}
 
 		this.fit.loadSettings(this.settings);
@@ -418,11 +457,17 @@ export default class FitPlugin extends Plugin {
 					if (key == "checkEveryXMinutes") {
 						obj[key] = Number(settings[key]);
 					}
-					else if (key === "notifyChanges" || key === "notifyConflicts" || key === "enableDebugLogging") {
+					else if (key === "notifyChanges" || key === "notifyConflicts" || key === "enableDebugLogging" || key === "giteaUseHttp") {
 						obj[key] = Boolean(settings[key]);
 					}
+					else if (key === "provider") {
+						obj[key] = settings[key] as "github" | "gitea";
+					}
+					else if (key === "autoSync") {
+						obj[key] = settings[key] as "on" | "off" | "muted" | "remind";
+					}
 					else {
-						obj[key] = settings[key];
+						obj[key] = String(settings[key]);
 					}
 				}
 				return obj;

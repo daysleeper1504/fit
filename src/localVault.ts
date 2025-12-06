@@ -195,6 +195,10 @@ export class LocalVault implements IVault<"local"> {
 		return readFileContent(this.vault, path);
 	}
 
+	async readFileContentBySha(blobSha: string): Promise<FileContent> {
+		throw new Error(`readFileContentBySha is not supported for local vaults. SHA: ${blobSha}`);
+	}
+
 	/**
 	 * Write or update a file and optionally compute its SHA.
 	 * @param path - File path

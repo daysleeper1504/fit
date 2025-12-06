@@ -65,8 +65,12 @@ A "vault" represents a complete collection of synced files, whether stored local
   - Handles both sync and push-only operations
 
 **Remote Backend Integration**:
-- Current implementation: RemoteGitHubVault using `@octokit/core` with automatic retry handling
-- Architecture supports adding RemoteGitLabVault, RemoteGiteaVault, etc. via IVault interface
+- **GitHub**: RemoteGitHubVault using `@octokit/core` with automatic retry handling
+- **Gitea**: RemoteGiteaVault using `@octokit/core` with custom baseUrl for self-hosted instances
+  - Supports HTTP/HTTPS protocol selection
+  - Uses Gitea API v1 (largely GitHub API v3 compatible)
+  - Handles Gitea-specific response formats
+- Architecture supports adding RemoteGitLabVault, etc. via IVault interface
 
 ### Support Systems
 - **FitLogger**: Cross-platform diagnostic logging (enabled by default, writes to `.obsidian/plugins/fit/debug.log`)
@@ -207,6 +211,7 @@ interface IVault {
 **Current implementations**:
 - `LocalVault`: Obsidian vault
 - `RemoteGitHubVault`: GitHub repositories
+- `RemoteGiteaVault`: Gitea repositories (self-hosted Git service)
 
 ### Custom Conflict Resolution
 Extend `FitSync` class to implement custom conflict resolution strategies:

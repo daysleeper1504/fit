@@ -166,6 +166,19 @@ export interface IVault<T extends VaultCategory> {
 	 */
 	readFileContent(path: string): Promise<FileContent>;
 
+	/**
+	 * Read file content by its blob SHA (for remote vaults only)
+	 *
+	 * This method is used to fetch the base version of a file for 3-way merging.
+	 * For remote vaults, it fetches content directly using the Git blob SHA.
+	 * For local vaults, this method is not applicable (will throw error).
+	 *
+	 * @param blobSha - The Git blob SHA of the file version to fetch
+	 * @returns File content with runtime encoding tag
+	 * @throws Error if not supported by vault type or if blob not found
+	 */
+	readFileContentBySha(blobSha: string): Promise<FileContent>;
+
 	// ===== Write Operations (Applying Changes) =====
 
 	/**

@@ -9,6 +9,7 @@ import { ApplyChangesResult, VaultError } from "./vault";
 import { Base64Content, FileContent, isBinaryExtension } from "./util/contentEncoding";
 import { detectNormalizationMismatches } from "./util/filePath";
 import { CommitSha } from "./util/hashing";
+import { merge3Way, MergeResult } from "./util/merge";
 
 // Helper to log SHA cache updates with provenance tracking
 function logCacheUpdate(
@@ -97,6 +98,7 @@ export type ConflictResolutionResult = {
 	path: string;
 	conflictFile?: { path: string; content: FileContent; }; // Conflict to write to _fit/ (always _fit/ prefixed)
 	directWrite?: { path: string; content: FileContent; }; // Safe direct write (no conflict, untracked file that doesn't exist)
+	mergedWrite?: { path: string; content: FileContent; hasConflicts: boolean; }; // 3-way merged file (may have conflict markers)
 };
 
 /**
@@ -165,6 +167,67 @@ export class FitSync implements IFitSync {
 		};
 	}
 
+	/**
+	 * Perform 3-way merge for a file that was modified on both local and remote.
+	 *
+	 * @param path - Path of the file to merge
+	 * @param localContent - Current local file content
+	 * @param remoteContent - Current remote file content
+	 * @param baseRemoteSha - SHA of the file from last successful sync (common ancestor)
+	 * @returns Merge result with merged content and conflict information
+	 */
+	private async perform3WayMerge(
+		path: string,
+		localContent: FileContent,
+		remoteContent: FileContent,
+		baseRemoteSha: string
+	): Promise<MergeResult & { mergedContent: FileContent }> {
+		fitLogger.log('[FitSync] Performing 3-way merge', {
+			path,
+			baseRemoteSha
+		});
+
+		// Fetch base version (common ancestor) from remote using the cached SHA
+		let baseContent: FileContent;
+		try {
+			baseContent = await this.fit.remoteVault.readFileContentBySha(baseRemoteSha);
+			fitLogger.log('[FitSync] Fetched base content for 3-way merge', {
+				path,
+				baseSha: baseRemoteSha,
+				baseLength: baseContent.toString().length
+			});
+		} catch (error) {
+			// If we can't fetch base, use empty string
+			// This happens if the file was created independently on both sides
+			fitLogger.log('[FitSync] Could not fetch base content, using empty base', {
+				path,
+				baseSha: baseRemoteSha,
+				error: error instanceof Error ? error.message : String(error)
+			});
+			baseContent = FileContent.fromPlainText('');
+		}
+
+		// Convert all to plain text for merging
+		const baseText = baseContent.toString();
+		const localText = localContent.toString();
+		const remoteText = remoteContent.toString();
+
+		// Perform 3-way merge
+		const mergeResult = merge3Way(baseText, localText, remoteText);
+
+		fitLogger.log('[FitSync] 3-way merge completed', {
+			path,
+			success: mergeResult.success,
+			conflictCount: mergeResult.conflictCount,
+			resultLength: mergeResult.content.length
+		});
+
+		return {
+			...mergeResult,
+			mergedContent: FileContent.fromPlainText(mergeResult.content)
+		};
+	}
+
 	private async resolveFileConflict(
 		clash: FileClash,
 		existenceMap?: Map<string, 'file' | 'folder' | 'nonexistent'>
@@ -228,14 +291,73 @@ export class FitSync implements IFitSync {
 		// Remote file was MODIFIED (not deleted)
 		if (clash.remoteOp !== "REMOVED") {
 			const remoteContent = await this.fit.remoteVault.readFileContent(clash.path);
-			// TODO: Should we really need to force to base64 to compare, even if hypothetically both were already plaintext?
 			const localBase64 = localFileContent.toBase64();
 			const remoteBase64 = remoteContent.toBase64();
 
 			if (remoteBase64 !== localBase64) {
-				const report = this.generateConflictReport(clash.path, localBase64, remoteBase64);
-				const conflictFile = this.prepareConflictFile(clash.path, report.remoteContent);
-				return {path: clash.path, conflictFile};
+				// Both sides modified the file - attempt 3-way merge
+				const detectedExtension = extractExtension(clash.path);
+
+				// Check if this is a binary file - can't merge binary files
+				if (detectedExtension && isBinaryExtension(detectedExtension)) {
+					fitLogger.log('[FitSync] Binary file conflict - cannot auto-merge, writing remote to _fit/', {
+						path: clash.path,
+						extension: detectedExtension
+					});
+					const conflictFile = this.prepareConflictFile(clash.path, remoteBase64);
+					return {path: clash.path, conflictFile};
+				}
+
+				// Get base version SHA from cache (last synced remote state)
+				const baseRemoteSha = this.fit.lastFetchedRemoteSha[clash.path];
+
+				if (!baseRemoteSha) {
+					// No base version available - file was created independently on both sides
+					// Fall back to writing remote to _fit/ for manual resolution
+					fitLogger.log('[FitSync] No base version for merge - files created independently, writing remote to _fit/', {
+						path: clash.path
+					});
+					const conflictFile = this.prepareConflictFile(clash.path, remoteBase64);
+					return {path: clash.path, conflictFile};
+				}
+
+				// Perform 3-way merge
+				const mergeResult = await this.perform3WayMerge(
+					clash.path,
+					localFileContent,
+					remoteContent,
+					baseRemoteSha
+				);
+
+				if (mergeResult.success) {
+					// Clean merge - no conflicts
+					fitLogger.log('[FitSync] Clean 3-way merge successful', {
+						path: clash.path,
+						noConflicts: true
+					});
+					return {
+						path: clash.path,
+						mergedWrite: {
+							path: clash.path,
+							content: mergeResult.mergedContent,
+							hasConflicts: false
+						}
+					};
+				} else {
+					// Merge has conflicts - write file with conflict markers
+					fitLogger.log('[FitSync] 3-way merge completed with conflicts', {
+						path: clash.path,
+						conflictCount: mergeResult.conflictCount
+					});
+					return {
+						path: clash.path,
+						mergedWrite: {
+							path: clash.path,
+							content: mergeResult.mergedContent,
+							hasConflicts: true
+						}
+					};
+				}
 			}
 			return { path: clash.path };
 		} else {
@@ -440,8 +562,10 @@ export class FitSync implements IFitSync {
 			}
 		}
 
-		// conflictFile = written to _fit/ (user-facing conflict)
-		// directWrite = written directly (safe, no conflict)
+		// Categorize resolution results:
+		// - conflictFile: written to _fit/ (binary files, missing base, or fallback cases)
+		// - directWrite: written directly (safe, no conflict, untracked file that doesn't exist)
+		// - mergedWrite: 3-way merged content (may have conflict markers if hasConflicts=true)
 		const conflictFilesToWrite = fileResolutions
 			.filter(r => r.conflictFile)
 			.map(r => r.conflictFile!);
@@ -450,27 +574,64 @@ export class FitSync implements IFitSync {
 			.filter(r => r.directWrite)
 			.map(r => r.directWrite!);
 
-		// Conflicts are determined by presence of conflictFile (always goes to _fit/)
+		const mergedWrites = fileResolutions
+			.filter(r => r.mergedWrite)
+			.map(r => r.mergedWrite!);
+
+		// Unresolved conflicts = files with conflict markers OR files written to _fit/
 		const unresolved = fileResolutions
-			.map((res, i) => res.conflictFile ? clashes[i] : null)
+			.map((res, i) => {
+				// Mark as unresolved if:
+				// 1. Written to _fit/ (conflictFile)
+				// 2. Merged but has conflict markers
+				if (res.conflictFile) return clashes[i];
+				if (res.mergedWrite && res.mergedWrite.hasConflicts) return clashes[i];
+				return null;
+			})
 			.filter(Boolean) as Array<FileClash>;
 
 		const changes: FileChange[] = [];
 
-		// TODO: Consolidate to call applyChanges once?
+		// Write files to _fit/ (binary conflicts, etc.)
 		if (conflictFilesToWrite.length > 0) {
 			const result = await this.fit.localVault.applyChanges(conflictFilesToWrite, []);
 			changes.push(...result.changes);
 		}
 
+		// Write directly (safe, no conflict)
 		if (directWrites.length > 0) {
 			const result = await this.fit.localVault.applyChanges(directWrites, []);
 			changes.push(...result.changes);
 		}
 
-		// Show "Change conflicts detected" notice if any conflicts will be written to _fit/
-		if (conflictFilesToWrite.length > 0) {
-			syncNotice.setMessage(`Change conflicts detected`);
+		// Write merged files (both clean merges and those with conflict markers)
+		if (mergedWrites.length > 0) {
+			const mergedFiles = mergedWrites.map(m => ({ path: m.path, content: m.content }));
+			const result = await this.fit.localVault.applyChanges(mergedFiles, []);
+			changes.push(...result.changes);
+
+			// Log merge statistics
+			const cleanMerges = mergedWrites.filter(m => !m.hasConflicts).length;
+			const conflictedMerges = mergedWrites.filter(m => m.hasConflicts).length;
+			fitLogger.log('[FitSync] Applied 3-way merged files', {
+				total: mergedWrites.length,
+				cleanMerges,
+				conflictedMerges
+			});
+		}
+
+		// Show appropriate notice based on conflict types
+		if (conflictFilesToWrite.length > 0 || mergedWrites.some(m => m.hasConflicts)) {
+			const conflictMarkerCount = mergedWrites.filter(m => m.hasConflicts).length;
+			const fitConflictCount = conflictFilesToWrite.length;
+
+			if (conflictMarkerCount > 0 && fitConflictCount > 0) {
+				syncNotice.setMessage(`Conflicts detected: ${conflictMarkerCount} files need manual merge, ${fitConflictCount} in _fit/`);
+			} else if (conflictMarkerCount > 0) {
+				syncNotice.setMessage(`${conflictMarkerCount} file(s) need manual merge (check conflict markers)`);
+			} else {
+				syncNotice.setMessage(`Change conflicts detected (see _fit/ directory)`);
+			}
 		}
 
 		return { changes, unresolved, filesMovedToFitDueToStatFailure, deletionsSkippedDueToStatFailure };

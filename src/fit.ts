@@ -10,6 +10,8 @@ import { FileChange, FileClash, FileStates, compareFileStates } from "./util/cha
 import { Vault } from "obsidian";
 import { LocalVault } from "./localVault";
 import { RemoteGitHubVault } from "./remoteGitHubVault";
+import { RemoteGiteaVault } from "./remoteGiteaVault";
+import { IVault } from "./vault";
 import { fitLogger } from "./logger";
 import { CommitSha } from "./util/hashing";
 
@@ -18,7 +20,7 @@ import { CommitSha } from "./util/hashing";
  *
  * Bridges two vault implementations:
  * - **LocalVault**: Obsidian vault file operations
- * - **RemoteGitHubVault**: GitHub repository operations
+ * - **RemoteGitHubVault** or **RemoteGiteaVault**: Remote repository operations
  *
  * Maintains sync state for efficient change detection.
  * All vault operations throw VaultError on failure (network, auth, remote not found).
@@ -26,6 +28,7 @@ import { CommitSha } from "./util/hashing";
  * @see FitSync - The high-level orchestrator that coordinates sync operations
  * @see LocalVault - Local Obsidian vault file operations
  * @see RemoteGitHubVault - Remote GitHub repository operations
+ * @see RemoteGiteaVault - Remote Gitea repository operations
  */
 export class Fit {
 	// TODO: Rename these for clarity: localFileShas, remoteCommitSha, remoteFileShas
@@ -33,7 +36,7 @@ export class Fit {
 	lastFetchedCommitSha: CommitSha | null; // Last synced commit SHA
 	lastFetchedRemoteSha: FileStates;       // Cache of remote file SHAs
 	localVault: LocalVault;                 // Local vault (tracks local file state)
-	remoteVault: RemoteGitHubVault;
+	remoteVault: IVault<"remote">;          // Remote vault (GitHub or Gitea)
 
 
 	constructor(setting: FitSettings, localStores: LocalStores, vault: Vault) {
@@ -43,16 +46,28 @@ export class Fit {
 	}
 
 	loadSettings(setting: FitSettings) {
-		// Recreate remoteVault with new settings (preserves existing state)
+		// Recreate remoteVault with new settings based on provider selection
 		// This is called when user changes settings in UI
-		// TODO: Use DI to pass the right impl from FitSync caller.
-		this.remoteVault = new RemoteGitHubVault(
-			setting.pat,
-			setting.owner,
-			setting.repo,
-			setting.branch,
-			setting.deviceName
-		);
+		if (setting.provider === "gitea") {
+			this.remoteVault = new RemoteGiteaVault(
+				setting.giteaUrl,
+				setting.giteaToken,
+				setting.giteaOwner,
+				setting.giteaRepo,
+				setting.giteaBranch,
+				setting.deviceName,
+				setting.giteaUseHttp
+			);
+		} else {
+			// Default to GitHub
+			this.remoteVault = new RemoteGitHubVault(
+				setting.pat,
+				setting.owner,
+				setting.repo,
+				setting.branch,
+				setting.deviceName
+			);
+		}
 	}
 
 	loadLocalStore(localStore: LocalStores) {
@@ -90,6 +105,7 @@ export class Fit {
 	 * Excludes paths based on sync policy:
 	 * - `_fit/`: Conflict resolution directory (written locally but not synced)
 	 * - `.obsidian/`: Obsidian workspace settings and plugin code
+	 * - `.obsidian-init`: Bootstrap file created during initial repo commit (Gitea-specific)
 	 *
 	 * Future: Will also respect .gitignore patterns when implemented.
 	 *
@@ -107,6 +123,12 @@ export class Fit {
 
 		// Exclude .obsidian/ directory (Obsidian workspace settings and plugins)
 		if (path.startsWith(".obsidian/")) {
+			return false;
+		}
+
+		// Exclude .obsidian-init file (bootstrap file created during initial repo commit)
+		// This file is only needed to initialize empty Gitea repos and should not be synced
+		if (path === ".obsidian-init") {
 			return false;
 		}
 
@@ -140,26 +162,38 @@ export class Fit {
 	/**
 	 * Get remote changes since last sync.
 	 *
-	 * Uses RemoteGitHubVault's internal caching - vault will only fetch from GitHub
+	 * Uses remote vault's internal caching - vault will only fetch from remote
 	 * if the latest commit SHA differs from its cached commit SHA.
 	 *
 	 * @returns Remote changes, current state, and the commit SHA of the fetched state
 	 */
 	async getRemoteChanges(): Promise<{changes: FileChange[], state: FileStates, commitSha: CommitSha}> {
-		fitLogger.log('.. ☁️ [RemoteVault] Fetching from GitHub...');
+		fitLogger.log('.. ☁️ [RemoteVault] Fetching from remote...');
 		const { state, commitSha } = await this.remoteVault.readFromSource();
 		if (!commitSha) {
-			throw new Error("Expected RemoteGitHubVault to provide commitSha");
+			throw new Error("Expected remote vault to provide commitSha");
 		}
-		const changes = compareFileStates(state, this.lastFetchedRemoteSha);
+		const allChanges = compareFileStates(state, this.lastFetchedRemoteSha);
+
+		// Filter out changes to files that should not be synced
+		// This excludes bootstrap files (_fit/, .obsidian/, .obsidian-init) and untrackable paths
+		const changes = allChanges.filter(change => this.shouldSyncPath(change.path));
 
 		// Diagnostic logging for tracking remote cache state
-		if (changes.length > 0) {
+		if (allChanges.length > 0) {
 			fitLogger.log('[Fit] Remote changes detected', {
-				ADDED: changes.filter(c => c.type === 'ADDED').length,
-				MODIFIED: changes.filter(c => c.type === 'MODIFIED').length,
-				REMOVED: changes.filter(c => c.type === 'REMOVED').length,
-				total: changes.length
+				ADDED: allChanges.filter(c => c.type === 'ADDED').length,
+				MODIFIED: allChanges.filter(c => c.type === 'MODIFIED').length,
+				REMOVED: allChanges.filter(c => c.type === 'REMOVED').length,
+				total: allChanges.length,
+				...(changes.length < allChanges.length && {
+					filtered: {
+						excluded: allChanges.length - changes.length,
+						ADDED: allChanges.filter(c => c.type === 'ADDED' && !this.shouldSyncPath(c.path)).length,
+						MODIFIED: allChanges.filter(c => c.type === 'MODIFIED' && !this.shouldSyncPath(c.path)).length,
+						REMOVED: allChanges.filter(c => c.type === 'REMOVED' && !this.shouldSyncPath(c.path)).length
+					}
+				})
 			});
 		}
 
@@ -203,26 +237,77 @@ export class Fit {
 	}
 
 	/**
-	 * Get authenticated user info from GitHub.
-	 * Delegates to RemoteGitHubVault (throws VaultError on failure).
+	 * Get authenticated user info from remote provider.
+	 * Delegates to remote vault (throws VaultError on failure).
 	 */
 	async getUser(): Promise<{owner: string, avatarUrl: string}> {
-		return await this.remoteVault.getUser();
+		if (this.remoteVault instanceof RemoteGitHubVault || this.remoteVault instanceof RemoteGiteaVault) {
+			return await this.remoteVault.getUser();
+		}
+		throw new Error("Remote vault doesn't support getUser()");
 	}
 
 	/**
 	 * List repositories owned by authenticated user.
-	 * Delegates to RemoteGitHubVault (throws VaultError on failure).
+	 * Delegates to remote vault (throws VaultError on failure).
 	 */
 	async getRepos(): Promise<string[]> {
-		return await this.remoteVault.getRepos();
+		if (this.remoteVault instanceof RemoteGitHubVault || this.remoteVault instanceof RemoteGiteaVault) {
+			return await this.remoteVault.getRepos();
+		}
+		throw new Error("Remote vault doesn't support getRepos()");
 	}
 
 	/**
 	 * List branches in repository.
-	 * Delegates to RemoteGitHubVault (throws VaultError on failure).
+	 * Delegates to remote vault (throws VaultError on failure).
 	 */
 	async getBranches(): Promise<string[]> {
-		return await this.remoteVault.getBranches();
+		if (this.remoteVault instanceof RemoteGitHubVault || this.remoteVault instanceof RemoteGiteaVault) {
+			return await this.remoteVault.getBranches();
+		}
+		throw new Error("Remote vault doesn't support getBranches()");
+	}
+
+	/**
+	 * Get default branch name for the repository.
+	 * Delegates to remote vault (throws VaultError on failure).
+	 */
+	async getDefaultBranch(): Promise<string> {
+		if (this.remoteVault instanceof RemoteGitHubVault || this.remoteVault instanceof RemoteGiteaVault) {
+			return await this.remoteVault.getDefaultBranch();
+		}
+		throw new Error("Remote vault doesn't support getDefaultBranch()");
+	}
+
+	/**
+	 * Test connection to remote provider.
+	 * Only available for Gitea provider.
+	 */
+	async testConnection(): Promise<{ success: boolean; message: string }> {
+		if (this.remoteVault instanceof RemoteGiteaVault) {
+			return await this.remoteVault.testConnection();
+		}
+		// GitHub doesn't have a dedicated test connection method, use getUser instead
+		if (this.remoteVault instanceof RemoteGitHubVault) {
+			try {
+				await this.remoteVault.getUser();
+				return { success: true, message: "Successfully connected to GitHub" };
+			} catch (error) {
+				return { success: false, message: error instanceof Error ? error.message : "Connection failed" };
+			}
+		}
+		throw new Error("Remote vault doesn't support testConnection()");
+	}
+
+	/**
+	 * Create a new branch on the remote
+	 * Delegates to remote vault (throws VaultError on failure).
+	 */
+	async createBranch(branchName: string): Promise<void> {
+		if (this.remoteVault instanceof RemoteGitHubVault || this.remoteVault instanceof RemoteGiteaVault) {
+			return await this.remoteVault.createBranch(branchName);
+		}
+		throw new Error("Remote vault doesn't support createBranch()");
 	}
 }
