@@ -10,10 +10,11 @@ import { retry } from "@octokit/plugin-retry";
 import { ApplyChangesResult, IVault, VaultError, VaultReadResult } from "./vault";
 import { FileChange, FileStates } from "./util/changeTracking";
 import { BlobSha, CommitSha, EMPTY_TREE_SHA, TreeSha } from "./util/hashing";
-import { FileContent, isBinaryExtension } from "./util/contentEncoding";
-import { FilePath, detectNormalizationIssues } from "./util/filePath";
+import { FileContent } from "./util/contentEncoding";
+import { detectNormalizationIssues } from "./util/filePath";
 import { withSlowOperationMonitoring } from "./util/asyncMonitoring";
 import { fitLogger } from "./logger";
+import { detectSuspiciousCorrespondence } from "./util/pathPattern";
 
 /**
  * Represents a node in GitHub's git tree structure
@@ -286,16 +287,8 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		content: FileContent | null,
 		currentState: FileStates
 	): Promise<TreeNode | null> {
-		let rawContent: string | null = null;
-		let encoding: 'base64' | 'utf-8' | undefined;
-		if (content !== null) {
-			const rawContentObj = content.toRaw();
-			rawContent = rawContentObj.content;
-			encoding = rawContentObj.encoding === 'base64' ? 'base64' : 'utf-8';
-		}
-
 		// Deletion case (content is null)
-		if (rawContent === null) {
+		if (content === null) {
 			// Skip deletion if file doesn't exist on remote
 			if (!(path in currentState)) {
 				return null;
@@ -309,11 +302,9 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		}
 
 		// Addition/modification case
-		if (!encoding) {
-			const filePath = FilePath.create(path);
-			const extension = FilePath.getExtension(filePath);
-			encoding = (extension && isBinaryExtension(extension)) ? "base64" : "utf-8";
-		}
+		const rawContentObj = content.toRaw();
+		const rawContent = rawContentObj.content;
+		const encoding = rawContentObj.encoding === 'base64' ? 'base64' : 'utf-8';
 		const blobSha = await this.createBlob(rawContent, encoding);
 
 		// Skip if file on remote is identical
@@ -331,12 +322,18 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 
 	/**
 	 * Create a new tree from tree nodes
+	 * @returns Object with treeSha and optional userWarning if encoding corruption detected
 	 */
 	private async createTree(
 		treeNodes: TreeNode[],
 		base_tree_sha: TreeSha
-	): Promise<TreeSha> {
+	): Promise<{ treeSha: TreeSha; userWarning?: string }> {
 		try {
+			// Diagnostic logging: capture intended paths BEFORE any corruption (Issue #51)
+			// Tree nodes are created correctly in JavaScript memory (UTF-16 strings)
+			// Corruption happens during HTTP request encoding (JSON serialization → bytes)
+			const pathsWeIntendedToSend = treeNodes.map(n => n.path).filter(Boolean);
+
 			const {data: newTree} = await this.octokit.request(
 				`POST /repos/{owner}/{repo}/git/trees`, {
 					owner: this.owner,
@@ -346,7 +343,69 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 					headers: this.headers
 				}
 			);
-			return newTree.sha as TreeSha;
+
+			// Diagnostic logging: compare INTENDED paths vs echoed paths to detect encoding corruption
+			// GitHub echoes back what it received, so if it differs from what we intended to send,
+			// we know corruption happened during the request (UTF-8→GBK encoding issue)
+			// Note: GitHub API does NOT guarantee response order, so we match by pattern instead of index
+			const echoedPaths = newTree.tree?.map((n: {path?: string}) => n.path).filter((p): p is string => !!p) ?? [];
+			const suspiciousMatches: Array<{intended: string, echoed: string, pattern: string}> = [];
+
+			const intendedPathsSet = new Set(pathsWeIntendedToSend);
+			const echoedPathsSet = new Set(echoedPaths);
+
+			// Find paths that were intended but are not present verbatim in the echoed response.
+			// These are candidates for having been corrupted.
+			for (const intended of intendedPathsSet) {
+				if (echoedPathsSet.has(intended)) {
+					continue; // Path was sent and received correctly.
+				}
+
+				// This path is missing. Check if any of the echoed paths are a corrupted version of it.
+				for (const echoed of echoedPathsSet) {
+					const match = detectSuspiciousCorrespondence(intended, echoed);
+					if (match) {
+						suspiciousMatches.push({ intended, echoed, pattern: match.pattern });
+						// Once a match is found, we can stop checking this intended path against other echoed paths.
+						break;
+					}
+				}
+			}
+
+			let userWarning: string | undefined;
+
+			if (suspiciousMatches.length > 0) {
+				// For diagnostic logging, convert strings to UTF-8 byte arrays
+				// Using Buffer (Node.js/Electron API) which is available in Obsidian desktop & mobile
+				const details = suspiciousMatches.map(({intended, echoed, pattern}) => ({
+					intended,
+					echoed,
+					pattern,
+					intendedBytes: Array.from(Buffer.from(intended, 'utf8')),
+					echoedBytes: Array.from(Buffer.from(echoed, 'utf8'))
+				}));
+
+				fitLogger.log(
+					`🔴 [RemoteVault] Encoding corruption detected during upload!\n` +
+					`Attempted to upload ${suspiciousMatches.length} file(s) but GitHub received different paths:\n` +
+					suspiciousMatches.map(({intended, echoed, pattern}) =>
+						`  - Intended: "${intended}" → Received: "${echoed}"\n    Pattern match: "${pattern}" = "${pattern}" ✅`
+					).join('\n') +
+					`\nThis indicates UTF-8→GBK corruption during request encoding. See logs and Issue #51.`,
+					{ details, issue: 'https://github.com/joshuakto/fit/issues/51' }
+				);
+
+				// Create user warning for immediate notification
+				userWarning = `🔴 Upload Encoding Corruption Detected!\n` +
+					`${suspiciousMatches.length} file(s) uploaded with corrupted names to GitHub.\n` +
+					`Check debug logs immediately and report to Issue #51.\n\n` +
+					`Affected files:\n` +
+					suspiciousMatches.map(({intended, echoed}) =>
+						`  • "${intended}" became "${echoed}"`
+					).join('\n');
+			}
+
+			return { treeSha: newTree.sha as TreeSha, userWarning };
 		} catch (error) {
 			return await this.wrapOctokitError(error, 'repo');
 		}
@@ -395,74 +454,6 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 	// ===== GitHub Utility Operations (not part of IVault) =====
 
 	/**
-	 * Get authenticated user information
-	 */
-	async getUser(): Promise<{owner: string, avatarUrl: string}> {
-		try {
-			const {data: response} = await this.octokit.request(
-				`GET /user`, {
-					headers: this.headers
-				});
-			return {owner: response.login, avatarUrl: response.avatar_url};
-		} catch (error) {
-			return await this.wrapOctokitError(error, 'ignore');
-		}
-	}
-
-	/**
-	 * Get list of repositories owned by authenticated user
-	 */
-	async getRepos(): Promise<string[]> {
-		const allRepos: string[] = [];
-		let page = 1;
-		const perPage = 100; // Set to the maximum value of 100
-
-		let hasMorePages = true;
-		while (hasMorePages) {
-			try {
-				const { data: response } = await this.octokit.request(
-					`GET /user/repos`, {
-						affiliation: "owner",
-						headers: this.headers,
-						per_page: perPage,
-						page: page
-					}
-				);
-				allRepos.push(...response.map(r => r.name));
-				// Check if there are more pages
-				if (response.length < perPage) {
-					hasMorePages = false;
-				}
-			} catch (error) {
-				return await this.wrapOctokitError(error, 'ignore');
-			}
-
-			page++;
-		}
-
-		return allRepos;
-	}
-
-	/**
-	 * Get list of branches for the repository.
-	 * Throws VaultError (remote_not_found) on 404 (repository not found).
-	 */
-	async getBranches(): Promise<string[]> {
-		try {
-			const {data: response} = await this.octokit.request(
-				`GET /repos/{owner}/{repo}/branches`,
-				{
-					owner: this.owner,
-					repo: this.repo,
-					headers: this.headers
-				});
-			return response.map(r => r.name);
-		} catch (error: unknown) {
-			return await this.wrapOctokitError(error, 'repo');
-		}
-	}
-
-	/**
 	 * Check if repository exists and is accessible
 	 * Result is cached to avoid repeated API calls during error handling.
 	 * @returns true if repository exists, false if 404 (not found)
@@ -498,11 +489,15 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 	 * Apply a batch of changes to remote (creates commit and pushes)
 	 * This is the primary write operation - creates a single commit with all changes
 	 * Accepts PlainTextContent for text files or Base64Content for binary files
+	 *
+	 * @param options.clashPaths - Ignored by RemoteVault (no _fit/ concept on remote)
 	 */
 	async applyChanges(
 		filesToWrite: Array<{path: string, content: FileContent}>,
-		filesToDelete: Array<string>
+		filesToDelete: Array<string>,
+		_options?: { clashPaths?: Set<string> }
 	): Promise<ApplyChangesResult<"remote">> {
+		// Note: clashPaths is ignored - remote doesn't have _fit/ directory concept
 		// Get current state using cache when available
 		const { state: currentState, commitSha: parentCommitSha, treeSha: parentTreeSha } = await this.readFromSource();
 
@@ -578,7 +573,7 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		}
 
 		// Create tree, commit, and update ref
-		const newTreeSha = await this.createTree(treeNodes, parentTreeSha);
+		const { treeSha: newTreeSha, userWarning } = await this.createTree(treeNodes, parentTreeSha);
 		const newCommitSha = await this.createCommit(newTreeSha, parentCommitSha);
 		await this.updateRef(newCommitSha);
 
@@ -617,7 +612,8 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 			changes,
 			commitSha: newCommitSha,
 			treeSha: newTreeSha,
-			newState
+			newState,
+			userWarning
 		};
 	}
 

@@ -42,8 +42,37 @@ export default [
 	},
 	{
 		// Test-related files: Allow 'any' type for mocking external libraries
-		// Covers: test files, mock implementations, and test utilities
-		files: ['**/*.test.ts', '**/__mocks__/**/*.ts', '**/testUtils.ts'],
+		// Covers: test files, mock implementations, test utilities, and test setup
+		files: ['**/*.test.ts', '**/__mocks__/**/*.ts', '**/testUtils.ts', '**/vitest.setup.ts'],
+		rules: {
+			'@typescript-eslint/no-explicit-any': 'off',
+		},
+	},
+	{
+		// E2E test files: Allow Mocha globals
+		files: ['**/*.e2e.ts'],
+		languageOptions: {
+			parser: tsParser,
+			parserOptions: {
+				sourceType: 'module',
+			},
+			globals: {
+				...globals.node,
+				...globals.browser,
+				// Mocha globals
+				describe: 'readonly',
+				it: 'readonly',
+				before: 'readonly',
+				after: 'readonly',
+				beforeEach: 'readonly',
+				afterEach: 'readonly',
+				expect: 'readonly',
+				// WebdriverIO globals
+				browser: 'readonly',
+				$: 'readonly',
+				$$: 'readonly',
+			},
+		},
 		rules: {
 			'@typescript-eslint/no-explicit-any': 'off',
 		},

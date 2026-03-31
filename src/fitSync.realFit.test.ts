@@ -12,11 +12,13 @@ import { FitSync } from './fitSync';
 import { Fit } from './fit';
 import { Vault } from 'obsidian';
 import { FakeLocalVault, FakeRemoteVault } from './testUtils';
+import { LocalVault } from './localVault';
 import { FitSettings, LocalStores } from '@main';
 import { VaultError } from './vault';
 import { fitLogger } from './logger';
 import { FileContent } from './util/contentEncoding';
 import { BlobSha, CommitSha } from './util/hashing';
+import FitNotice from './fitNotice';
 
 describe('FitSync', () => {
 	let localVault: FakeLocalVault;
@@ -381,7 +383,7 @@ describe('FitSync', () => {
 				]),
 				clash: [{
 					path: '_fit/remote-conflict.md',
-					localState: 'untracked',
+					localState: 'protected',
 					remoteOp: 'ADDED'
 				}]
 			});
@@ -526,14 +528,126 @@ describe('FitSync', () => {
 			// Verify: Remote still has the remote version
 			expect(remoteVault.getFile('.hidden-config.json')).toBe('Remote version');
 
-			// Verify: LocalStores updated with normal file
-			// Hidden file is NOT in localSha (not tracked)
-			expect(Object.keys(localStoreState.localSha)).toEqual(['normal.md']);
-			// Hidden file IS in lastFetchedRemoteSha (asymmetric behavior)
-			expect(Object.keys(localStoreState.lastFetchedRemoteSha).sort()).toEqual(['.hidden-config.json', 'normal.md']);
+			// Verify: LocalStores updated with both files (issue #169 fix)
+			// Hidden file IS now in localSha (SHA keyed by original path, not _fit/ path)
+			expect(localStoreState.localSha).toMatchObject({
+				'normal.md': expect.any(String),
+				'.hidden-config.json': expect.any(String)
+			});
+			expect(localStoreState.lastFetchedRemoteSha).toMatchObject({
+				'normal.md': expect.any(String),
+				'.hidden-config.json': expect.any(String)
+			});
 		});
 
-		it('should conservatively save remote hidden files to _fit/ even when no local version exists', async () => {
+		it('should update directly after user accepts _fit/ version (#169)', async () => {
+			// Test: Clash → User accepts _fit/ version → Next sync updates directly
+			//
+			// === SETUP: Start from empty state, then create clash ===
+			localStoreState = {
+				localSha: {},
+				lastFetchedRemoteSha: {},
+				lastFetchedCommitSha: (await remoteVault.readFromSource()).commitSha
+			};
+
+			// Local has hidden file, remote adds same file with different content
+			localVault.setFile('.hidden', 'Local content');
+			await remoteVault.setFile('.hidden', 'Remote content v1');
+
+			const fitSync = createFitSync();
+
+			// === STEP 1: Sync - clashes to _fit/ and records baseline ===
+			await syncAndHandleResult(fitSync, createMockNotice());
+
+			expect(localVault.getAllFilesAsRaw()).toMatchObject({
+				'.hidden': 'Local content', // Local version preserved
+				'_fit/.hidden': 'Remote content v1' // Remote version saved to _fit/
+			});
+			expect(localStoreState.localSha['.hidden']).toBeDefined(); // Baseline recorded
+
+			// === STEP 2: User accepts remote version and deletes _fit/ file ===
+			localVault.setFile('.hidden', 'Remote content v1');
+			await localVault.applyChanges([], ['_fit/.hidden']);
+
+			// === STEP 3: Remote updates file ===
+			await remoteVault.setFile('.hidden', 'Remote content v2');
+
+			// === STEP 4: Sync - should update directly (local matches baseline) ===
+			await syncAndHandleResult(fitSync, createMockNotice());
+
+			expect(localVault.getAllFilesAsRaw()).toEqual({
+				'.hidden': 'Remote content v2', // Updated directly, no new clash
+				// Note: No _fit/.hidden file created
+			});
+		});
+
+		it('should write remote hidden file directly when local unchanged from baseline (#169)', async () => {
+			// === SETUP: Initial synced state (no hidden file yet) ===
+			const initialContent = 'Initial config v1';
+			localVault.setFile('normal.md', 'Normal content');
+			await remoteVault.setFile('normal.md', 'Normal content');
+
+			let remoteResult = await remoteVault.readFromSource();
+			localStoreState = {
+				localSha: await localVault.readFromSource().then(r => r.state),
+				lastFetchedRemoteSha: remoteResult.state,
+				lastFetchedCommitSha: remoteResult.commitSha
+			};
+			const fitSync = createFitSync();
+
+			// === STEP 1: Device A creates hidden file and syncs ===
+			await remoteVault.setFile('.hidden-config.json', initialContent);
+
+			// === STEP 2: Device B syncs - pulls hidden file ===
+			// File doesn't exist locally, so written directly (not a clash)
+			let mockNotice = createMockNotice();
+			let result = await syncAndHandleResult(fitSync, mockNotice);
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+
+			// Verify: File was written directly
+			expect(localVault.getAllFilesAsRaw()).toMatchObject({
+				'.hidden-config.json': initialContent,
+				'normal.md': 'Normal content'
+			});
+			// Baseline SHA now stored for future syncs
+			expect(localStoreState.localSha).toHaveProperty('.hidden-config.json');
+
+			// === STEP 3: Device A modifies hidden file and pushes ===
+			const updatedContent = 'Updated config v2';
+			await remoteVault.setFile('.hidden-config.json', updatedContent);
+
+			// === STEP 4: Device B syncs again - local unchanged from baseline ===
+			// Local file still has initial content (unchanged from baseline SHA)
+			// Remote file has updated content
+			// Expected: Apply remote changes directly (no clash) - this is the #169 fix!
+			mockNotice = createMockNotice();
+			result = await syncAndHandleResult(fitSync, mockNotice);
+
+			// Verify: Sync succeeds and file was written directly (not to _fit/)
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+			expect(localVault.getAllFilesAsRaw()).toMatchObject({
+				'.hidden-config.json': updatedContent,
+				'normal.md': 'Normal content'
+			});
+			// No second clash file created
+			expect(localVault.getAllFilesAsRaw()).not.toHaveProperty('_fit/.hidden-config.json');
+
+			// Verify: LocalStores updated with hidden file SHA (now includes hidden files in localSha)
+			expect(localStoreState).toMatchObject({
+				localSha: {
+					'.hidden-config.json': expect.anything(),
+				},
+				lastFetchedRemoteSha: {
+					'.hidden-config.json': expect.anything(),
+					'normal.md': expect.anything(),
+				},
+			});
+		});
+
+		it('should write remote hidden files directly when no local version exists (#169)', async () => {
+			// Test: Remote adds hidden file → written directly (not to _fit/)
+			// Baseline SHA recorded in localSha for future comparison
+			//
 			// === SETUP: Initial synced state ===
 			const fitSync = createFitSync();
 
@@ -546,27 +660,25 @@ describe('FitSync', () => {
 				{ path: 'visible.md', content: FileContent.fromPlainText('Visible content') }
 			], []);
 
-			// === STEP 2: Attempt sync ===
+			// === STEP 2: Sync - both files written directly ===
 			const mockNotice = createMockNotice();
 			const result = await syncAndHandleResult(fitSync, mockNotice);
 
-			// Verify: Sync succeeded
 			expect(result).toEqual(expect.objectContaining({ success: true }));
-
-			// Verify: Both files pulled normally (hidden file doesn't exist locally, so safe to write)
 			expect(localVault.getAllFilesAsRaw()).toEqual({
-				'.hidden-config.json': 'Remote hidden content',
+				'.hidden-config.json': 'Remote hidden content',  // Written directly (doesn't exist locally)
 				'visible.md': 'Visible content'
 			});
 
-			// Verify: LocalStores has asymmetric tracking (hidden files in remote but not local)
+			// Verify: Baseline SHA recorded for hidden file (#169)
 			expect(localStoreState).toMatchObject({
 				localSha: {
-					'visible.md': expect.any(String)  // Only visible file (hidden filtered by shouldTrackState)
+					'.hidden-config.json': expect.any(String),  // NEW: Baseline recorded for direct write
+					'visible.md': expect.any(String)
 				},
 				lastFetchedRemoteSha: {
-					'.hidden-config.json': expect.any(String),  // Hidden file tracked (passes shouldSyncPath)
-					'visible.md': expect.any(String)            // Visible file tracked
+					'.hidden-config.json': expect.any(String),
+					'visible.md': expect.any(String)
 				}
 			});
 		});
@@ -638,6 +750,14 @@ describe('FitSync', () => {
 
 			// Verify: Remote file unchanged
 			expect(remoteVault.getFile('.env')).toBe('API_KEY=new-remote-value');
+
+			// Verify: SHA keyed by original path ".env", NOT "_fit/.env" (issue #169)
+			// This enables proper change detection on subsequent syncs
+			const expectedSha = await LocalVault.fileSha1('.env', FileContent.fromPlainText('API_KEY=new-remote-value'));
+			expect(localStoreState.localSha).toEqual({
+				'.env': expectedSha,
+				// Must NOT have '_fit/.env'
+			});
 
 			// NOTE: Current protection works because shouldTrackState correctly returns false
 			// for hidden files, triggering the clash detection logic in FitSync.applyRemoteChanges().
@@ -832,9 +952,8 @@ describe('FitSync', () => {
 			// === VERIFY: All notice messages (progress + conflict detection + status) ===
 			expect(mockNotice._calls).toEqual([
 				{method: 'setMessage', args: ['Checking for changes...']},
-				{method: 'setMessage', args: ['Change conflicts detected']},
 				{method: 'setMessage', args: ['Uploading local changes']},
-				{method: 'setMessage', args: ['Writing remote changes to local']},
+				{method: 'setMessage', args: ['Change conflicts detected']},
 				{method: 'setMessage', args: ['Synced with remote, unresolved conflicts written to _fit']}
 			]);
 		});
@@ -873,7 +992,7 @@ describe('FitSync', () => {
 				'[FitSync] Couldn\'t check if some paths exist locally - conservatively treating as clash',
 				{
 					error: statError,
-					deletionsSkipped: ['.editorconfig']
+					deletionsSkipped: ['.editorconfig'] // Untracked files with baselines are protected from deletion
 				}
 			);
 		});
@@ -921,9 +1040,8 @@ describe('FitSync', () => {
 			// === VERIFY: All notice messages (progress + conflict detection + status) ===
 			expect(mockNotice._calls).toEqual([
 				{method: 'setMessage', args: ['Checking for changes...']},
-				{method: 'setMessage', args: ['Change conflicts detected']},
 				{method: 'setMessage', args: ['Uploading local changes']},
-				{method: 'setMessage', args: ['Writing remote changes to local']},
+				{method: 'setMessage', args: ['Change conflicts detected']},
 				{method: 'setMessage', args: ['Synced with remote, unresolved conflicts written to _fit']}
 			]);
 		});
@@ -1531,6 +1649,149 @@ describe('FitSync', () => {
 				noticeCount: 0, // Cleaned up after last completes
 				activeSyncRequests: 0,
 			});
+		});
+	});
+
+	describe('🔤 Encoding corruption detection (Issue #51)', () => {
+		it('should create FitNotice when localVault.applyChanges returns userWarning', async () => {
+			// Test that FitSync properly handles userWarning from vault operations
+			// Actual detection logic is tested in localVault.test.ts
+
+			// Mock FitNotice to avoid DOM dependencies
+			const fitNoticeSpy = vi.spyOn(FitNotice.prototype, 'show').mockImplementation(() => {});
+
+			// Mock localVault.applyChanges to return a userWarning
+			const mockApplyChanges = vi.spyOn(localVault, 'applyChanges').mockResolvedValue({
+				changes: [{ path: 'test.md', type: 'ADDED' }],
+				newBaselineStates: Promise.resolve({ 'test.md': 'mock-sha' as BlobSha }),
+				userWarning: '⚠️ Encoding Issue Detected\nSuspicious filename patterns found during sync.'
+			});
+
+			// Setup a simple sync scenario
+			remoteVault.setFile('test.md', 'content');
+			localStoreState = {
+				localSha: {},
+				lastFetchedRemoteSha: {},
+				lastFetchedCommitSha: remoteVault.getCommitSha()
+			};
+
+			const fitSync = createFitSync();
+			const mockNotice = createMockNotice();
+			const result = await syncAndHandleResult(fitSync, mockNotice);
+
+			// Sync should succeed (warnings are informational, not errors)
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+
+			// Verify FitNotice.show() was called (warning notice was created and shown)
+			expect(fitNoticeSpy).toHaveBeenCalled();
+
+			mockApplyChanges.mockRestore();
+			fitNoticeSpy.mockRestore();
+		});
+	});
+
+	describe('Fit settings - GitHub config', () => {
+		it('should update remoteVault when loadSettings is called with new owner', () => {
+			const initialSettings = {
+				...testSettings,
+				owner: 'initial-owner'
+			} as FitSettings;
+
+			const fit = new Fit(
+				initialSettings,
+				localStoreState,
+				{} as unknown as Vault
+			);
+
+			expect(fit.remoteVault.getOwner()).toBe('initial-owner');
+
+			// Update settings with new owner
+			fit.loadSettings({
+				...initialSettings,
+				owner: 'new-owner'
+			});
+
+			expect(fit.remoteVault.getOwner()).toBe('new-owner');
+		});
+
+		it('should recreate remoteVault after clearRemoteVault is called (re-authentication scenario)', () => {
+			// Scenario: User auth fails, clearRemoteVault is called, then user enters new PAT
+			const initialSettings = {
+				...testSettings,
+				pat: 'old-token',
+				owner: 'valid-owner',
+			} as FitSettings;
+
+			const fit = new Fit(
+				initialSettings,
+				localStoreState,
+				{} as unknown as Vault
+			);
+
+			expect(fit.remoteVault.getOwner()).toBe('valid-owner');
+
+			// Simulate auth failure - clearRemoteVault is called
+			fit.clearRemoteVault();
+
+			// Now loadSettings with empty owner should create new remoteVault
+			fit.loadSettings({
+				...initialSettings,
+				pat: 'new-token',
+				owner: ''
+			});
+
+			// New vault should have empty owner (will be set after getUser() succeeds)
+			expect(fit.remoteVault.getOwner()).toBe('');
+		});
+
+		it('should not recreate remoteVault when PAT is empty', () => {
+			const initialSettings = {
+				...testSettings,
+				pat: 'valid-token',
+				owner: 'valid-owner',
+			} as FitSettings;
+
+			const fit = new Fit(
+				initialSettings,
+				localStoreState,
+				{} as unknown as Vault
+			);
+
+			const originalVault = fit.remoteVault;
+
+			// Clear PAT - should preserve existing remoteVault
+			fit.loadSettings({
+				...initialSettings,
+				pat: '',
+				owner: 'valid-owner',
+			});
+
+			// remoteVault should be the same instance (not recreated)
+			expect(fit.remoteVault).toBe(originalVault);
+		});
+
+		it('should read v1.3 settings correctly', () => {
+			// CAUTION: don't change these expected settings unless you know what
+			// you're doing or you'll break existing users' saved settings.
+			const v13settings = {
+				pat: 'fake-test-token',
+				owner: 'test-owner',
+				repo: 'test-repo',
+				branch: 'test-branch',
+				deviceName: 'test-device'
+			};
+
+			// Given: Stored settings as of v1.3
+			const fit = new Fit(
+				v13settings as FitSettings,
+				localStoreState,
+				{} as unknown as Vault
+			);
+
+			// Then: The remoteVault should be created with the correct owner etc.
+			expect(fit.remoteVault.getOwner()).toBe(v13settings.owner);
+			expect(fit.remoteVault.getRepo()).toBe(v13settings.repo);
+			expect(fit.remoteVault.getBranch()).toBe(v13settings.branch);
 		});
 	});
 });

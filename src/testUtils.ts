@@ -6,9 +6,8 @@ import { TFile } from 'obsidian';
 import { TreeNode } from './remoteGitHubVault';
 import { ApplyChangesResult, IVault, VaultError, VaultReadResult } from './vault';
 import { FileChange, FileStates } from "./util/changeTracking";
-import { FileContent, Base64Content, Content, PlainTextContent, isBinaryExtension } from './util/contentEncoding';
+import { FileContent, Base64Content, PlainTextContent } from './util/contentEncoding';
 import { FilePath } from './util/filePath';
-import { extractExtension } from './utils';
 import { BlobSha, CommitSha, computeSha1, TreeSha } from "./util/hashing";
 import { LocalVault } from './localVault';
 import { fitLogger } from './logger';
@@ -53,6 +52,92 @@ export class StubTFile extends TFile {
 
 		return stub as TFile;
 	}
+}
+
+/**
+ * Fake Obsidian vault that simulates the real Obsidian behavior:
+ * - vault index (getAbstractFileByPath) does NOT include hidden files
+ * - adapter (filesystem) DOES include all files
+ * - vault.create/modify/delete work only for indexed (non-hidden) files
+ *
+ * This is more realistic than simple mocks and can be used across test files.
+ */
+export class FakeObsidianVault {
+	private filesOnDisk = new Map<string, ArrayBuffer>(); // path -> binary content
+	private vaultIndex = new Set<string>(); // Paths in vault index (non-hidden)
+
+	getAbstractFileByPath(path: string) {
+		// Simulate: vault index never returns hidden files
+		if (path.startsWith('.') || !this.vaultIndex.has(path)) return null;
+		return { path } as TFile;
+	}
+
+	adapter = {
+		stat: async (path: string) => {
+			if (this.filesOnDisk.has(path)) {
+				return { type: 'file', size: this.filesOnDisk.get(path)!.byteLength, ctime: 0, mtime: 0 };
+			}
+			// Check if it's a folder (any file starts with "path/")
+			for (const filePath of this.filesOnDisk.keys()) {
+				if (filePath.startsWith(path + '/')) {
+					return { type: 'folder', size: 0, ctime: 0, mtime: 0 };
+				}
+			}
+			return null; // File/folder doesn't exist
+		},
+		mkdir: async (_path: string) => {
+			// No-op for fake vault - folders are implicit
+		},
+		readBinary: async (path: string) => {
+			const content = this.filesOnDisk.get(path);
+			if (!content) throw new Error('ENOENT: no such file');
+			return content;
+		},
+		write: async (path: string, data: string) => {
+			this.filesOnDisk.set(path, new TextEncoder().encode(data).buffer);
+		},
+		writeBinary: async (path: string, data: ArrayBuffer) => {
+			this.filesOnDisk.set(path, data);
+		},
+		remove: async (path: string) => {
+			this.filesOnDisk.delete(path);
+		}
+	};
+
+	// Vault methods (work only for indexed files)
+	readBinary = async (file: TFile) => {
+		const content = this.filesOnDisk.get(file.path);
+		if (!content) throw new Error('File not found');
+		return content;
+	};
+
+	create = async (path: string, data: string) => {
+		if (this.filesOnDisk.has(path)) throw new Error('File already exists.');
+		this.filesOnDisk.set(path, new TextEncoder().encode(data).buffer);
+		if (!path.startsWith('.')) this.vaultIndex.add(path);
+	};
+
+	createBinary = async (path: string, data: ArrayBuffer) => {
+		if (this.filesOnDisk.has(path)) throw new Error('File already exists.');
+		this.filesOnDisk.set(path, data);
+		if (!path.startsWith('.')) this.vaultIndex.add(path);
+	};
+
+	modify = async (file: TFile, data: string) => {
+		this.filesOnDisk.set(file.path, new TextEncoder().encode(data).buffer);
+	};
+
+	modifyBinary = async (file: TFile, data: ArrayBuffer) => {
+		this.filesOnDisk.set(file.path, data);
+	};
+
+	delete = async (file: TFile) => {
+		this.filesOnDisk.delete(file.path);
+		this.vaultIndex.delete(file.path);
+	};
+
+	getFiles = () => Array.from(this.vaultIndex).map(path => ({ path } as TFile));
+	createFolder = async () => {};
 }
 
 /**
@@ -327,23 +412,39 @@ export class FakeLocalVault implements IVault<"local"> {
 
 	/**
 	 * Set file content directly (for test setup).
+	 * Simulates Obsidian's storage behavior:
+	 * - Text files: stored as plaintext (decodes base64 if needed)
+	 * - Binary files: stored as base64 (detected via decoding failure or null bytes)
 	 */
 	setFile(path: string, content: string | PlainTextContent | FileContent): void {
-		// Normalize to logical encoding based on path (for convenient test assertions).
-		const detectedExtension = extractExtension(path);
-		const isBinary = detectedExtension && isBinaryExtension(detectedExtension);
-
-		let fileContent: FileContent;
-		if (content instanceof FileContent) {
-			// Normalize: binary files stay as-is, text files convert to plaintext
-			fileContent = isBinary ? content : FileContent.fromPlainText(content.toPlainText());
-		} else {
-			// Create FileContent from string: binary → base64, text → plaintext
-			fileContent = isBinary
-				? FileContent.fromBase64(Content.encodeToBase64(content))
-				: FileContent.fromPlainText(content);
+		if (!(content instanceof FileContent)) {
+			// Raw string, treat as plaintext
+			this.files.set(path, FileContent.fromPlainText(content));
+			return;
 		}
-		this.files.set(path, fileContent);
+
+		const raw = content.toRaw();
+		if (raw.encoding === 'plaintext') {
+			// Already plaintext, store as-is
+			this.files.set(path, content);
+			return;
+		}
+
+		// Base64 content - try to decode as text (simulates Obsidian's behavior)
+		try {
+			const decoded = content.toPlainText();
+			// Check for null bytes (binary indicator)
+			if (decoded.includes('\0')) {
+				// Binary file, keep as base64
+				this.files.set(path, content);
+			} else {
+				// Valid text, store as plaintext
+				this.files.set(path, FileContent.fromPlainText(decoded));
+			}
+		} catch {
+			// Decoding failed - binary file, keep as base64
+			this.files.set(path, content);
+		}
 	}
 
 	/**
@@ -478,8 +579,10 @@ export class FakeLocalVault implements IVault<"local"> {
 
 	async applyChanges(
 		filesToWrite: Array<{path: string, content: FileContent}>,
-		filesToDelete: Array<string>
+		filesToDelete: Array<string>,
+		options?: { clashPaths?: Set<string> }
 	): Promise<ApplyChangesResult<"local">> {
+		const clashPaths = options?.clashPaths ?? new Set();
 		const error = this.failureScenarios.get('write');
 		if (error) {
 			this.clearFailure('write');
@@ -491,9 +594,12 @@ export class FakeLocalVault implements IVault<"local"> {
 		// Use Promise.allSettled to match real LocalVault behavior
 		const writeSettledResults = await Promise.allSettled(
 			filesToWrite.map(async (file) => {
+				// If path is in clashPaths, write to _fit/ subdirectory (like real LocalVault)
+				const writePath = clashPaths.has(file.path) ? `_fit/${file.path}` : file.path;
+
 				// Call mock if provided (allows test to inject failures)
 				if (this.mockWriteFile) {
-					await this.mockWriteFile(file.path);
+					await this.mockWriteFile(writePath);
 				}
 
 				// Simulate file/folder conflicts that occur in real filesystems:
@@ -503,24 +609,25 @@ export class FakeLocalVault implements IVault<"local"> {
 				const existingPaths = Array.from(this.files.keys());
 
 				// Check #1: File path conflicts with existing folder
-				if (existingPaths.some(p => p.startsWith(file.path + '/'))) {
+				if (existingPaths.some(p => p.startsWith(writePath + '/'))) {
 					throw VaultError.filesystem(
-						`Cannot create file "${file.path}" - a folder with this name already exists`
+						`Cannot create file "${writePath}" - a folder with this name already exists`
 					);
 				}
 
 				// Check #2: Parent folder path conflicts with existing file
-				const parentFolder = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : null;
+				const parentFolder = writePath.includes('/') ? writePath.substring(0, writePath.lastIndexOf('/')) : null;
 				if (parentFolder && this.files.has(parentFolder)) {
 					throw VaultError.filesystem(
-						`Cannot create folder "${parentFolder}" for file "${file.path}" - a file with this name already exists`
+						`Cannot create folder "${parentFolder}" for file "${writePath}" - a file with this name already exists`
 					);
 				}
 
-				const existed = this.files.has(file.path);
-				this.setFile(file.path, file.content);
+				const existed = this.files.has(writePath);
+				this.setFile(writePath, file.content);
 				const changeType: 'MODIFIED' | 'ADDED' = existed ? 'MODIFIED' : 'ADDED';
-				return { path: file.path, type: changeType };
+				// Return FileChange with write path (matches real LocalVault)
+				return { path: writePath, type: changeType };
 			})
 		);
 
@@ -568,30 +675,43 @@ export class FakeLocalVault implements IVault<"local"> {
 
 		// Start computing SHAs for written files asynchronously (for later retrieval)
 		// Only for trackable files that will appear in future scans
-		const writtenStates = this.computeWrittenFileShas(filesToWrite);
+		const newBaselineStates = this.computeWrittenFileShas(filesToWrite, clashPaths);
 
 		return {
 			changes,
-			writtenStates
+			newBaselineStates
 		};
 	}
 
 	/**
 	 * Compute SHAs for files that were just written.
-	 * Only tracks files that shouldTrackState (will appear in future scans).
+	 * Mirrors LocalVault behavior: computes for direct writes + untracked clashes to enable baseline tracking (#169).
+	 * Tracked clash files self-heal via local scan, so SHAs are not computed for them.
+	 * Uses pathForSha to compute SHA for original path when file written as clash.
 	 */
 	private async computeWrittenFileShas(
-		filesToWrite: Array<{path: string, content: FileContent}>
+		filesToWrite: Array<{path: string, content: FileContent}>,
+		clashPaths: Set<string>
 	): Promise<FileStates> {
 		const shaPromises = filesToWrite
-			.filter(({path}) => this.shouldTrackState(path))
 			.map(async ({path, content}) => {
-				const sha = await LocalVault.fileSha1(path, content);
-				return [path, sha] as const;
+				const writePath = clashPaths.has(path) ? `_fit/${path}` : path;
+				const shaPath = clashPaths.has(path) ? path : undefined;
+				const pathForSha = shaPath ?? writePath;
+
+				// Only compute SHA for:
+				// 1. Direct writes (shaPath === undefined), OR
+				// 2. Untracked clash files (shaPath defined AND !shouldTrackState)
+				// Tracked clash files self-heal via local scan, so skip SHA computation
+				if (shaPath === undefined || !this.shouldTrackState(pathForSha)) {
+					const sha = await LocalVault.fileSha1(pathForSha, content);
+					return [path, sha] as const;
+				}
+				return null;
 			});
 
 		const results = await Promise.all(shaPromises);
-		return Object.fromEntries(results);
+		return Object.fromEntries(results.filter((r): r is [string, BlobSha] => r !== null));
 	}
 
 	shouldTrackState(path: string): boolean {
@@ -755,7 +875,8 @@ export class FakeRemoteVault implements IVault<"remote"> {
 
 	async applyChanges(
 		filesToWrite: Array<{path: string, content: FileContent}>,
-		filesToDelete: Array<string>
+		filesToDelete: Array<string>,
+		_options?: { clashPaths?: Set<string> }
 	): Promise<ApplyChangesResult<"remote">> {
 		if (this.failureError) {
 			const error = this.failureError;

@@ -85,13 +85,16 @@ export const Content = {
 	 * Convert Base64Content to PlainTextContent
 	 * Handles multi-byte UTF-8 characters (emojis, Chinese, etc.)
 	 * @throws {DOMException} If content is not valid base64
+	 * @throws {TypeError} If decoded bytes are not valid UTF-8 (binary data)
 	 * @see https://developer.mozilla.org/en-US/docs/Web/API/atob#unicode_strings
 	 */
 	decodeFromBase64: (base64: string | Base64Content): PlainTextContent => {
 		// Decode base64 to bytes, then decode UTF-8
 		const binaryString = atob(base64);
 		const utf8Bytes = Uint8Array.from(binaryString, char => char.charCodeAt(0));
-		return new TextDecoder().decode(utf8Bytes) as PlainTextContent;
+		// fatal: true prevents silent replacement character corruption
+		// Will throw TypeError if bytes aren't valid UTF-8 (e.g., binary data)
+		return new TextDecoder('utf-8', { fatal: true }).decode(utf8Bytes) as PlainTextContent;
 	},
 };
 
@@ -180,42 +183,6 @@ export class FileContent {
 		}
 	}
 }
-
-/**
- * Check if a file extension indicates binary content.
- * Binary files are treated as opaque (no diffs, special conflict handling).
- *
- * @param extension - File extension WITHOUT leading dot (e.g., "png", "pdf", not ".png")
- *                    Leading dots are automatically stripped if present.
- */
-export function isBinaryExtension(extension: string): boolean {
-	const normalized = extension.startsWith('.') ? extension.slice(1) : extension;
-	return RECOGNIZED_BINARY_EXT.has(normalized.toLowerCase());
-}
-
-/**
- * File extensions that should be treated as binary/opaque content.
- * Used for:
- * 1. Reading files correctly from Obsidian (prefer readBinary for these)
- * 2. User-facing decisions (don't show diffs, treat conflicts as opaque)
- *
- * CURRENT LIMITATIONS:
- * - Small hardcoded list means unknown binary types (.zip, .sqlite, .webp, etc.)
- *   are mishandled as text, which can cause corruption
- * - Extension-based detection is inherently limited (files without extensions,
- *   misnamed files, etc.)
- *
- * TODO: Implement content-based binary detection instead of extension guessing:
- * 1. Technical reading (Obsidian API):
- *    - Try vault.read() first, catch UTF-8 decode errors
- *    - Fall back to vault.readBinary() if decode fails
- *    - Or always use readBinary() and decode as UTF-8, checking for invalid sequences
- * 2. Semantic binary detection (user-facing):
- *    - Detect actual binary content (null bytes, high ratio of non-printable chars)
- *    - Use for conflict resolution UI (show diffs vs "binary file changed")
- * 3. Alternative: Use mime-type library for better extension coverage as interim solution
- */
-const RECOGNIZED_BINARY_EXT = new Set(["png", "jpg", "jpeg", "pdf"]);
 
 /**
  * Normalize base64 string by removing all whitespace (newlines, spaces, tabs).

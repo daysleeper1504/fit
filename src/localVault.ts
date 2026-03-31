@@ -13,6 +13,7 @@ import { contentToArrayBuffer, readFileContent } from "./util/obsidianHelpers";
 import { BlobSha, computeSha1 } from "./util/hashing";
 import { FilePath, detectNormalizationIssues } from "./util/filePath";
 import { withSlowOperationMonitoring } from "./util/asyncMonitoring";
+import { findSuspiciousCorrespondences } from "./util/pathPattern";
 
 /**
  * Helper to process Promise.allSettled results and collect failures
@@ -33,9 +34,24 @@ function collectSettledFailures<T>(
 
 /**
  * Frozen list of binary file extensions for SHA calculation consistency.
- * IMPORTANT: This list is FROZEN to ensure SHA calculations remain stable even if
- * contentEncoding.ts adds new binary extensions in the future. Adding new extensions
- * there should NOT change how we compute SHAs for existing files.
+ *
+ * IMPORTANT: This list is FROZEN to prevent spurious sync operations.
+ *
+ * Why this matters:
+ * - Before PR #XXX: Non-listed binaries (.zip, .exe, etc.) had SHAs computed on
+ *   CORRUPTED plaintext (with replacement characters �) because toPlainText()
+ *   silently corrupted binary data
+ * - After PR #XXX: toPlainText() throws on binary, fileSha1() catches and uses base64
+ * - Problem: Existing .zip files will get DIFFERENT SHAs (corrupted vs correct)
+ * - Result: Plugin detects "change" and tries to sync the same file again
+ *
+ * Solution:
+ * - Keep list FROZEN to avoid batch SHA changes for existing users
+ * - New fatal:true logic handles unlisted extensions gracefully via try/catch
+ * - Users with .zip files will see ONE spurious sync after upgrading (acceptable)
+ *
+ * Future: Implement SHA migration strategy to expand this list safely
+ * (e.g., version stores, detect and re-hash on upgrade, warn users)
  *
  * DO NOT modify this list unless you implement a SHA migration strategy.
  */
@@ -214,16 +230,36 @@ export class LocalVault implements IVault<"local"> {
 		const normalizedPath = FilePath.create(path);
 		const extension = FilePath.getExtension(normalizedPath);
 
-		const contentToHash = (extension && isBinaryExtensionForSha(extension))
+		let contentToHash: string;
+		if (extension && isBinaryExtensionForSha(extension)) {
 			// Use base64 representation for consistent hashing
-			? fileContent.toBase64()
+			contentToHash = fileContent.toBase64();
+		} else {
 			// Preserve plaintext SHA logic for non-binary case.
-			: fileContent.toPlainText();
+			// NOTE: For non-FROZEN extensions like .zip, if content is binary,
+			// toPlainText() will now throw (due to fatal:true in decodeFromBase64).
+			// We intentionally fall back to base64 to avoid corruption.
+			// This may cause SHA changes for existing .zip files, but prevents
+			// silent replacement character corruption in SHA computation.
+			// TODO(future): Implement SHA migration strategy to expand FROZEN_BINARY_EXT_FOR_SHA
+			// to include all common binary extensions (.zip, .exe, .bin, etc.)
+			try {
+				contentToHash = fileContent.toPlainText();
+			} catch {
+				// Binary content detected (invalid UTF-8) - fall back to base64
+				contentToHash = fileContent.toBase64();
+			}
+		}
 		return computeSha1(normalizedPath + contentToHash) as Promise<BlobSha>;
 	}
 
 	/**
-	 * Ensure folder exists for a given file path
+	 * Ensure folder exists for a given file path (creates parent directories recursively)
+	 *
+	 * Uses a functional approach to decide between Vault API and adapter:
+	 * - If getAbstractFileByPath returns a folder, it exists and Vault API can see it
+	 * - If getAbstractFileByPath returns null, check adapter.stat to see if it exists on disk
+	 * - For creation: use Vault API if the path is trackable, adapter otherwise
 	 */
 	private async ensureFolderExists(path: string): Promise<void> {
 		// Extract folder path, return empty string if no folder path is matched (exclude the last /)
@@ -232,17 +268,63 @@ export class LocalVault implements IVault<"local"> {
 			// At root, no parent to create
 			return;
 		}
-		const checkExists = () => {
-			const folder = this.vault.getAbstractFileByPath(folderPath);
-			return !!folder;
-		};
-		if (!checkExists()) {
+
+		// Split path into parts and create each level if needed
+		const parts = folderPath.split('/');
+		let currentPath = '';
+
+		for (const part of parts) {
+			currentPath = currentPath ? `${currentPath}/${part}` : part;
+
+			// First, check if Vault API can see this folder
+			const abstractFile = this.vault.getAbstractFileByPath(currentPath);
+			if (abstractFile) {
+				// Vault API can see it - check if it's a folder or file
+				if (abstractFile instanceof TFile) {
+					throw new Error(`Cannot create folder at ${currentPath}: a file already exists at this path`);
+				}
+				// It's a folder (TFolder or similar), continue to next level
+				continue;
+			}
+
+			// Vault API returns null - either folder doesn't exist, or it's a hidden path
+			// Check adapter.stat to see if it exists on disk
+			let stat;
 			try {
-				await this.vault.createFolder(folderPath);
+				stat = await this.vault.adapter.stat(currentPath);
+			} catch {
+				// Adapter throws for non-existent paths, treat as not existing
+				stat = null;
+			}
+
+			if (stat) {
+				if (stat.type === 'file') {
+					throw new Error(`Cannot create folder at ${currentPath}: a file already exists at this path`);
+				}
+				// Folder exists on disk (hidden folder), continue to next level
+				continue;
+			}
+
+			// Folder doesn't exist, create it
+			// Use Vault API if the path is trackable (Vault can manage it), adapter otherwise
+			try {
+				if (this.shouldTrackState(currentPath + '/placeholder')) {
+					// Trackable path - use vault API (keeps vault index in sync)
+					await this.vault.createFolder(currentPath);
+				} else {
+					// Untrackable path (hidden) - use adapter directly
+					await this.vault.adapter.mkdir(currentPath);
+				}
 			} catch (error) {
-				// Race condition safeguard: if folder already exists, ignore error and treat as
-				// success. This can happen if a concurrent operation created the same folder.
-				if (!checkExists()) {
+				// Race condition safeguard: if folder was created concurrently, ignore error
+				let recheckStat;
+				try {
+					recheckStat = await this.vault.adapter.stat(currentPath);
+				} catch {
+					// Can't verify folder exists, re-throw original error
+					throw error;
+				}
+				if (!recheckStat || recheckStat.type !== 'folder') {
 					throw error;
 				}
 			}
@@ -258,43 +340,81 @@ export class LocalVault implements IVault<"local"> {
 
 	/**
 	 * Write or update a file and optionally compute its SHA.
-	 * @param path - File path
+	 * Uses the appropriate Obsidian API based on file encoding:
+	 * - Plaintext files: vault.create() / vault.modify()
+	 * - Binary files: vault.createBinary() / vault.modifyBinary()
+	 *
+	 * @param path - File path (where to write the file)
 	 * @param content - File content (always Base64Content - GitHub API returns all blobs as base64)
-	 * @param originalContent - The FileContent object we're writing (for SHA computation)
-	 * @returns Record of file operation performed and SHA promise (if trackable)
+	 * @param originalContent - The FileContent object we're writing (for SHA computation and encoding detection)
+	 * @param shaPath - Optional path to use for SHA computation (if different from write path, for clash files)
+	 * @returns Record of file operation performed and SHA promise (always computed for baseline tracking)
 	 */
 	private async writeFile(
 		path: string,
 		content: Base64Content,
-		originalContent: FileContent
+		originalContent: FileContent,
+		shaPath?: string
 	): Promise<{ change: FileChange; shaPromise: Promise<BlobSha> | null }> {
 		try {
 			const file = this.vault.getAbstractFileByPath(path);
+			const rawContent = originalContent.toRaw();
+			const isPlaintext = rawContent.encoding === 'plaintext';
+
+			let changeType: 'ADDED' | 'MODIFIED';
 
 			if (file && file instanceof TFile) {
-				await this.vault.modifyBinary(file, contentToArrayBuffer(content));
-			} else if (!file) {
-				await this.ensureFolderExists(path);
-				await this.vault.createBinary(path, contentToArrayBuffer(content));
-			} else {
-				// File exists but is not a TFile - check if it's a folder
-				if (file instanceof TFolder) {
-					throw new Error(`Cannot write file to ${path}: a folder with that name already exists`);
+				// File is in vault index - use standard modify
+				if (isPlaintext) {
+					await this.vault.modify(file, rawContent.content);
+				} else {
+					await this.vault.modifyBinary(file, contentToArrayBuffer(content));
 				}
+				changeType = 'MODIFIED';
+			} else if (file instanceof TFolder) {
+				// Path exists as a folder
+				throw new Error(`Cannot write file to ${path}: a folder with that name already exists`);
+			} else if (file) {
 				// Unknown type - future-proof for new Obsidian abstract file types
 				throw new Error(`Cannot write file to ${path}: path exists but is not a file (type: ${file.constructor.name})`);
+			} else {
+				// File not in vault index - check if it exists on disk (hidden files)
+				// See docs/api-compatibility.md "Reading Untracked Files"
+				let existsOnDisk = false;
+				try {
+					// stat() can throw or return null for non-existent files depending on adapter implementation.
+					// A successful stat returns a Stat object, which is truthy.
+					existsOnDisk = !!(await this.vault.adapter.stat(path));
+				} catch {
+					// If it throws, the file doesn't exist.
+					existsOnDisk = false;
+				}
+
+				if (existsOnDisk) {
+					// File exists but not in index - use adapter to modify
+					if (isPlaintext) {
+						await this.vault.adapter.write(path, rawContent.content);
+					} else {
+						await this.vault.adapter.writeBinary(path, contentToArrayBuffer(content));
+					}
+					changeType = 'MODIFIED';
+				} else {
+					// File doesn't exist - create new
+					await this.ensureFolderExists(path);
+					if (isPlaintext) {
+						await this.vault.create(path, rawContent.content);
+					} else {
+						await this.vault.createBinary(path, contentToArrayBuffer(content));
+					}
+					changeType = 'ADDED';
+				}
 			}
 
-			const change: FileChange = { path, type: file ? "MODIFIED" : "ADDED" };
-
-			// Compute SHA from in-memory content if file should be tracked
-			// See docs/sync-logic.md "SHA Computation from In-Memory Content" for rationale
-			let shaPromise: Promise<BlobSha> | null = null;
-			if (this.shouldTrackState(path)) {
-				shaPromise = LocalVault.fileSha1(path, originalContent);
-			}
-
-			return { change, shaPromise };
+			// Compute SHA once at the end for all paths
+			return {
+				change: { path, type: changeType },
+				shaPromise: this.computeShaIfNeeded(shaPath, path, originalContent)
+			};
 		} catch (error) {
 			// Re-throw VaultError as-is (don't double-wrap)
 			if (error instanceof VaultError) {
@@ -306,6 +426,26 @@ export class LocalVault implements IVault<"local"> {
 	}
 
 	/**
+	 * Compute SHA for a file if needed based on tracking rules.
+	 * See docs/sync-logic.md "SHA Computation from In-Memory Content" for rationale.
+	 */
+	private computeShaIfNeeded(
+		shaPath: string | undefined,
+		writePath: string,
+		content: FileContent
+	): Promise<BlobSha> | null {
+		// Compute SHA if:
+		// 1. Direct write (shaPath === undefined), OR
+		// 2. Untracked clash file (shaPath defined AND !shouldTrackState)
+		// Tracked clash files self-heal via local scan, so skip SHA computation (#169)
+		const pathForSha = shaPath ?? writePath;
+		if (shaPath === undefined || !this.shouldTrackState(pathForSha)) {
+			return LocalVault.fileSha1(pathForSha, content);
+		}
+		return null;
+	}
+
+	/**
 	 * Delete a file
 	 * @returns Record of file operation performed
 	 */
@@ -313,10 +453,19 @@ export class LocalVault implements IVault<"local"> {
 		try {
 			const file = this.vault.getAbstractFileByPath(path);
 			if (file && file instanceof TFile) {
+				// File is in vault index - use standard deletion
 				await this.vault.delete(file);
 				return {path, type: "REMOVED"};
+			} else if (file instanceof TFolder) {
+				throw new Error(`Cannot delete ${path}: it is a folder, not a file`);
+			} else if (file) {
+				throw new Error(`Cannot delete ${path}: unknown file type (${file.constructor.name})`);
 			}
-			throw new Error(`Attempting to delete ${path} from local but not successful, file is of type ${typeof file}.`);
+
+			// File not in vault index - use adapter to delete (hidden files)
+			// See docs/api-compatibility.md "Reading Untracked Files"
+			await this.vault.adapter.remove(path);
+			return {path, type: "REMOVED"};
 		} catch (error) {
 			// Re-throw VaultError as-is (don't double-wrap)
 			if (error instanceof VaultError) {
@@ -330,16 +479,71 @@ export class LocalVault implements IVault<"local"> {
 	/**
 	 * Apply a batch of changes (writes and deletes)
 	 * Expects all content to be Base64Content (from GitHub API)
+	 *
+	 * @param options.clashPaths - Set of paths that should be written as clash files to `_fit/{path}`.
+	 *   For tracked files: computes SHA for original path (enables baseline tracking).
+	 *   For untracked files: SHA computed for original path (enables baseline tracking).
+	 *   Returned newBaselineStates uses original path as key, not write path.
 	 */
 	async applyChanges(
 		filesToWrite: Array<{path: string, content: FileContent}>,
-		filesToDelete: Array<string>
+		filesToDelete: Array<string>,
+		options?: { clashPaths?: Set<string> }
 	): Promise<ApplyChangesResult<"local">> {
+		const clashPaths = options?.clashPaths ?? new Set();
+		// Diagnostic logging: detect suspicious filename correspondences (Issue #51)
+		// Check if any files being created have non-ASCII chars and match existing local files
+		// Note: vault.getFiles() may be unavailable in test mocks
+		const allExistingPaths = this.vault.getFiles?.()?.map(f => f.path) ?? [];
+		const suspiciousWrites: Array<{remote: string, local: string, pattern: string}> = [];
+
+		for (const {path: remotePath} of filesToWrite) {
+			// Only check files with non-ASCII characters that don't already exist
+			if (!/[^\x00-\x7F]/.test(remotePath)) continue;
+			if (this.vault.getAbstractFileByPath(remotePath)) continue;
+
+			// Find correspondences with existing files
+			const matches = findSuspiciousCorrespondences(remotePath, allExistingPaths);
+			for (const match of matches) {
+				suspiciousWrites.push({
+					remote: match.candidate,
+					local: match.existing,
+					pattern: match.pattern
+				});
+			}
+		}
+
+		if (suspiciousWrites.length > 0) {
+			fitLogger.log(
+				`⚠️  [LocalVault] Suspicious filenames detected during sync!\n` +
+				`Attempting to create ${suspiciousWrites.length} local file(s), each matching an existing local file:\n` +
+				suspiciousWrites.map(({remote, local, pattern}, i) =>
+					`  ${i + 1}. Remote: "${remote}" ↔ Local: "${local}"\n` +
+					`     Match: "${pattern}" = "${pattern}" ✅`
+				).join('\n') +
+				`\nThis may indicate encoding corruption from a previous sync.\n` +
+				`If the remote filenames look wrong, check GitHub and delete corrupted versions.\n` +
+				`See Issue #51: https://github.com/joshuakto/fit/issues/51`,
+				{ suspiciousWrites, issue: 'https://github.com/joshuakto/fit/issues/51' }
+			);
+		}
+
+		const userWarning = suspiciousWrites.length > 0
+			? `⚠️ Encoding Issue Detected\n` +
+				`Suspicious filename patterns found during sync. ` +
+				`Check console logs for details or see Issue #51.`
+			: undefined;
+
 		// Process file additions or updates
 		// Monitor for slow file write operations
 		const writeSettledResults = await withSlowOperationMonitoring(
 			Promise.allSettled(
-				filesToWrite.map(async ({path, content}) => this.writeFile(path, content.toBase64(), content))
+				filesToWrite.map(async ({path, content}) => {
+					// If path is in clashPaths, write to _fit/ subdirectory
+					const writePath = clashPaths.has(path) ? `_fit/${path}` : path;
+					const shaPath = clashPaths.has(path) ? path : undefined;
+					return this.writeFile(writePath, content.toBase64(), content, shaPath);
+				})
 			),
 			`Local vault file writes (${filesToWrite.length} files)`,
 			{ warnAfterMs: 10000 }
@@ -408,17 +612,22 @@ export class LocalVault implements IVault<"local"> {
 		const changes = [...writeOps, ...deletionOps];
 
 		// Collect SHA promises from write operations (started asynchronously in writeFile)
-		// Map: path -> SHA promise (only for trackable files)
+		// Map: original path -> SHA promise (keyed by original path, not write path for clash files)
+		// Only includes files with SHA computations (direct writes + untracked clashes) (#169)
+		// Tracked clash files are excluded (null shaPromise) as they self-heal via local scan
 		const shaPromiseMap: Record<string, Promise<BlobSha>> = {};
-		for (const result of writeResults) {
+		for (let i = 0; i < writeResults.length; i++) {
+			const result = writeResults[i];
 			if (result.shaPromise) {
-				shaPromiseMap[result.change.path] = result.shaPromise;
+				// Key by original path from filesToWrite, not the write path (which may be _fit/...)
+				const originalPath = filesToWrite[i].path;
+				shaPromiseMap[originalPath] = result.shaPromise;
 			}
 		}
 
 		// Return SHA computations as promise for caller to await when ready
 		// This allows SHA computation (CPU-intensive) to run in parallel with other sync operations
-		const writtenStates = Promise.all(
+		const newBaselineStates = Promise.all(
 			Object.entries(shaPromiseMap).map(async ([path, shaPromise]) => {
 				const sha = await shaPromise;
 				return [path, sha] as const;
@@ -427,7 +636,8 @@ export class LocalVault implements IVault<"local"> {
 
 		return {
 			changes,
-			writtenStates
+			newBaselineStates,
+			userWarning
 		};
 	}
 }

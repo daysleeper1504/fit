@@ -6,7 +6,7 @@
  */
 
 import { LocalStores, FitSettings } from "@main";
-import { FileChange, FileClash, FileStates, compareFileStates } from "./util/changeTracking";
+import { FileChange, FileClash, FileStates, LocalClashState, compareFileStates } from "./util/changeTracking";
 import { Vault } from "obsidian";
 import { LocalVault } from "./localVault";
 import { RemoteGitHubVault } from "./remoteGitHubVault";
@@ -46,6 +46,21 @@ export class Fit {
 		// Recreate remoteVault with new settings (preserves existing state)
 		// This is called when user changes settings in UI
 		// TODO: Use DI to pass the right impl from FitSync caller.
+
+		// Skip if no PAT - no API access possible
+		if (!setting.pat) {
+			return;
+		}
+
+		// If owner is invalid but we have a valid remoteVault, preserve it
+		// This prevents overwriting a valid config with an incomplete one
+		// Example: User types "alice" → onChange fires 5 times with partial values ("a", "al", ...)
+		// Note: clearRemoteVault() should be called on auth failure to allow re-creation
+		// TODO: Shouldn't this be validated when SAVING settings vs LOADING?
+		if (!setting.owner && this.remoteVault) {
+			return;
+		}
+
 		this.remoteVault = new RemoteGitHubVault(
 			setting.pat,
 			setting.owner,
@@ -53,6 +68,14 @@ export class Fit {
 			setting.branch,
 			setting.deviceName
 		);
+	}
+
+	/**
+	 * Clear the remoteVault instance.
+	 * Call this on authentication failure to allow re-creation on next attempt.
+	 */
+	clearRemoteVault() {
+		this.remoteVault = undefined as unknown as RemoteGitHubVault;
 	}
 
 	loadLocalStore(localStore: LocalStores) {
@@ -96,6 +119,8 @@ export class Fit {
 	 * Note: This is sync policy, not a storage limitation. Both LocalVault and
 	 * RemoteGitHubVault can read/write these paths - we choose not to sync them.
 	 *
+	 * TODO: Rename to isProtectedPath() and invert logic (return true for protected paths)
+	 *
 	 * @param path - File path to check
 	 * @returns true if path should be included in sync
 	 */
@@ -134,7 +159,23 @@ export class Fit {
 		fitLogger.log('.. 💾 [LocalVault] Scanning files...');
 		const readResult = await this.localVault.readFromSource();
 		const currentState = readResult.state;
-		const changes = compareFileStates(currentState, this.localSha);
+		// Filter both states to only trackable files for comparison (#169)
+		// This prevents hidden files (stored for baseline checking) from appearing as spurious changes
+		// Filter cached state to exclude hidden files
+		const trackableLocalSha: FileStates = {};
+		for (const [path, sha] of Object.entries(this.localSha)) {
+			if (this.localVault.shouldTrackState(path)) {
+				trackableLocalSha[path] = sha;
+			}
+		}
+		// Filter current state to exclude hidden files (defensive against bugs)
+		const trackableCurrentState: FileStates = {};
+		for (const [path, sha] of Object.entries(currentState)) {
+			if (this.localVault.shouldTrackState(path)) {
+				trackableCurrentState[path] = sha;
+			}
+		}
+		const changes = compareFileStates(trackableCurrentState, trackableLocalSha);
 		return { changes, state: currentState };
 	}
 
@@ -177,9 +218,13 @@ export class Fit {
 			if (this.shouldSyncPath(remoteChange.path) && this.localVault.shouldTrackState(remoteChange.path)) {
 				trackedRemoteChanges.push(remoteChange);
 			} else {
+				// Determine if blocked by sync policy or untracked
+				const localState: LocalClashState = !this.shouldSyncPath(remoteChange.path)
+					? 'protected'
+					: 'untracked';
 				clashes.push({
 					path: remoteChange.path,
-					localState: 'untracked',
+					localState,
 					remoteOp: remoteChange.type
 				});
 			}
@@ -201,29 +246,5 @@ export class Fit {
 		}
 
 		return clashes;
-	}
-
-	/**
-	 * Get authenticated user info from GitHub.
-	 * Delegates to RemoteGitHubVault (throws VaultError on failure).
-	 */
-	async getUser(): Promise<{owner: string, avatarUrl: string}> {
-		return await this.remoteVault.getUser();
-	}
-
-	/**
-	 * List repositories owned by authenticated user.
-	 * Delegates to RemoteGitHubVault (throws VaultError on failure).
-	 */
-	async getRepos(): Promise<string[]> {
-		return await this.remoteVault.getRepos();
-	}
-
-	/**
-	 * List branches in repository.
-	 * Delegates to RemoteGitHubVault (throws VaultError on failure).
-	 */
-	async getBranches(): Promise<string[]> {
-		return await this.remoteVault.getBranches();
 	}
 }
